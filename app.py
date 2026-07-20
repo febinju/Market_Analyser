@@ -142,9 +142,12 @@ def index():
     return app.send_static_file("index.html")
 
 
+# Do one synchronous fetch immediately so the dashboard isn't empty on load,
+# and start the background refresh thread. This runs whether the app is
+# started directly (python3 app.py) or imported by gunicorn on Render.
+latest_data = {"stocks": [analyze_ticker(t) for t in WATCHLIST], "updated": pd.Timestamp.now().strftime("%H:%M:%S")}
+_refresh_thread = threading.Thread(target=refresh_loop, daemon=True)
+_refresh_thread.start()
+
 if __name__ == "__main__":
-    # Do one synchronous fetch immediately so the dashboard isn't empty on load
-    latest_data = {"stocks": [analyze_ticker(t) for t in WATCHLIST], "updated": pd.Timestamp.now().strftime("%H:%M:%S")}
-    t = threading.Thread(target=refresh_loop, daemon=True)
-    t.start()
     app.run(debug=False, port=5000)
