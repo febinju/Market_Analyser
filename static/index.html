@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Day Trading Signals</title>
+<style>
+  body { font-family: -apple-system, Arial, sans-serif; background: #111; color: #eee; margin: 0; padding: 20px; }
+  h1 { font-size: 20px; margin-bottom: 4px; }
+  .updated { color: #888; font-size: 12px; margin-bottom: 16px; }
+  .funds-bar { background: #1c1c1c; padding: 12px 16px; border-radius: 8px; margin-bottom: 20px; display: flex; align-items: center; gap: 10px; }
+  .funds-bar input { padding: 6px 10px; border-radius: 6px; border: 1px solid #444; background: #222; color: #eee; width: 140px; }
+  .funds-bar button { padding: 6px 14px; border-radius: 6px; border: none; background: #3b82f6; color: white; cursor: pointer; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid #2a2a2a; }
+  th { color: #999; font-size: 12px; text-transform: uppercase; }
+  .buy { color: #22c55e; font-weight: bold; }
+  .sell { color: #ef4444; font-weight: bold; }
+  .hold { color: #888; }
+  .reason { color: #999; font-size: 12px; }
+  .err { color: #f59e0b; }
+</style>
+</head>
+<body>
+  <h1>Watchlist Signals</h1>
+  <div class="updated" id="updated">Loading...</div>
+
+  <div class="funds-bar">
+    <label for="funds">Available funds (₹):</label>
+    <input type="number" id="funds" placeholder="e.g. 50000">
+    <button onclick="saveFunds()">Save</button>
+    <span id="fundsStatus"></span>
+  </div>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Ticker</th>
+        <th>Price (₹)</th>
+        <th>SMA9</th>
+        <th>SMA21</th>
+        <th>RSI</th>
+        <th>Signal</th>
+        <th>Reason</th>
+      </tr>
+    </thead>
+    <tbody id="rows"></tbody>
+  </table>
+
+<script>
+async function loadSignals() {
+  try {
+    const res = await fetch('/api/signals');
+    const data = await res.json();
+    document.getElementById('updated').textContent = 'Last updated: ' + (data.updated || '--');
+    const rows = document.getElementById('rows');
+    rows.innerHTML = '';
+    (data.stocks || []).forEach(s => {
+      const tr = document.createElement('tr');
+      if (s.error) {
+        tr.innerHTML = `<td>${s.ticker}</td><td colspan="6" class="err">${s.error}</td>`;
+      } else {
+        const cls = s.signal === 'BUY' ? 'buy' : s.signal === 'SELL' ? 'sell' : 'hold';
+        tr.innerHTML = `
+          <td>${s.ticker}</td>
+          <td>${s.price}</td>
+          <td>${s.sma_short ?? '-'}</td>
+          <td>${s.sma_long ?? '-'}</td>
+          <td>${s.rsi ?? '-'}</td>
+          <td class="${cls}">${s.signal}</td>
+          <td class="reason">${s.reason}</td>`;
+      }
+      rows.appendChild(tr);
+    });
+  } catch (e) {
+    document.getElementById('updated').textContent = 'Error loading signals: ' + e;
+  }
+}
+
+async function loadFunds() {
+  const res = await fetch('/api/funds');
+  const data = await res.json();
+  document.getElementById('funds').value = data.available_funds || '';
+}
+
+async function saveFunds() {
+  const val = parseFloat(document.getElementById('funds').value) || 0;
+  await fetch('/api/funds', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ available_funds: val })
+  });
+  document.getElementById('fundsStatus').textContent = 'Saved ✓';
+  setTimeout(() => document.getElementById('fundsStatus').textContent = '', 2000);
+}
+
+loadSignals();
+loadFunds();
+setInterval(loadSignals, 60000); // refresh every 60s
+</script>
+</body>
+</html>
