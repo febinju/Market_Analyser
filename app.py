@@ -16,18 +16,20 @@ import time
 app = Flask(__name__)
 
 # ---- Config ----
-# NSE tickers need a ".NS" suffix for yfinance
-WATCHLIST = ["SUZLON.NS", "IDEA.NS", "IEX.NS", "YESBANK.NS", "TATAPOWER.NS"]
+DEFAULT_WATCHLIST = ["SUZLON.NS", "IDEA.NS", "IEX.NS", "YESBANK.NS", "TATAPOWER.NS"]
+MAX_WATCHLIST_SIZE = 5
 
 SHORT_WINDOW = 9    # short SMA period (in candles)
 LONG_WINDOW = 21     # long SMA period (in candles)
 RSI_PERIOD = 14
 
 FUNDS_FILE = os.path.join(os.path.dirname(__file__), "funds.json")
+WATCHLIST_FILE = os.path.join(os.path.dirname(__file__), "watchlist.json")
 
 # In-memory cache of the latest computed signals
 latest_data = {}
 data_lock = threading.Lock()
+watchlist_lock = threading.Lock()
 
 
 def load_funds():
@@ -42,6 +44,18 @@ def save_funds(amount):
         json.dump({"available_funds": amount}, f)
 
 
+def load_watchlist():
+    if os.path.exists(WATCHLIST_FILE):
+        with open(WATCHLIST_FILE, "r") as f:
+            return json.load(f).get("tickers", DEFAULT_WATCHLIST)
+    return list(DEFAULT_WATCHLIST)
+
+
+def save_watchlist(tickers):
+    with open(WATCHLIST_FILE, "w") as f:
+        json.dump({"tickers": tickers}, f)
+
+
 def compute_rsi(series, period=RSI_PERIOD):
     delta = series.diff()
     gain = delta.where(delta > 0, 0.0)
@@ -53,17 +67,19 @@ def compute_rsi(series, period=RSI_PERIOD):
     return rsi
 
 
-def fetch_batch_with_retry(max_retries=3):
+def fetch_batch_with_retry(tickers, max_retries=3):
     """
     Fetch all watchlist tickers in a single yfinance call (much friendlier
     to rate limits than one call per ticker), retrying with backoff on
     rate-limit errors.
     """
+    if not tickers:
+        return None
     delay = 20  # seconds
     for attempt in range(max_retries):
         try:
             data = yf.download(
-                WATCHLIST, period="5d", interval="5m",
+                tickers, period="5d", interval="5m",
                 progress=False, group_by="ticker", threads=False,
             )
             if data is not None and not data.empty:
@@ -140,14 +156,21 @@ def analyze_ticker(ticker, batch_df):
         return {"ticker": ticker.replace(".NS", ""), "error": str(e)}
 
 
-def refresh_loop():
-    """Background thread: refresh all tickers every 5 minutes (batched call)."""
+def do_refresh():
+    """Fetch + analyze the current watchlist, updating latest_data."""
     global latest_data
+    with watchlist_lock:
+        tickers = load_watchlist()
+    batch_df = fetch_batch_with_retry(tickers)
+    results = [analyze_ticker(t, batch_df) for t in tickers]
+    with data_lock:
+        latest_data = {"stocks": results, "updated": pd.Timestamp.now().strftime("%H:%M:%S")}
+
+
+def refresh_loop():
+    """Background thread: refresh the watchlist every 5 minutes (batched call)."""
     while True:
-        batch_df = fetch_batch_with_retry()
-        results = [analyze_ticker(t, batch_df) for t in WATCHLIST]
-        with data_lock:
-            latest_data = {"stocks": results, "updated": pd.Timestamp.now().strftime("%H:%M:%S")}
+        do_refresh()
         time.sleep(300)  # 5 minutes between refreshes to stay well under rate limits
 
 
@@ -155,6 +178,56 @@ def refresh_loop():
 def get_signals():
     with data_lock:
         return jsonify(latest_data)
+
+
+@app.route("/api/watchlist", methods=["GET"])
+def get_watchlist():
+    with watchlist_lock:
+        tickers = load_watchlist()
+    return jsonify({"tickers": [t.replace(".NS", "") for t in tickers]})
+
+
+@app.route("/api/watchlist/add", methods=["POST"])
+def add_to_watchlist():
+    body = request.get_json(force=True)
+    raw = (body.get("ticker") or "").strip().upper()
+    if not raw:
+        return jsonify({"error": "No ticker provided"}), 400
+
+    ticker = raw if raw.endswith(".NS") else raw + ".NS"
+
+    with watchlist_lock:
+        tickers = load_watchlist()
+        if ticker in tickers:
+            return jsonify({"error": f"{raw} is already in the watchlist"}), 400
+        if len(tickers) >= MAX_WATCHLIST_SIZE:
+            return jsonify({"error": f"Watchlist is full (max {MAX_WATCHLIST_SIZE} stocks). Remove one first."}), 400
+        tickers.append(ticker)
+        save_watchlist(tickers)
+
+    # Refresh immediately in the background so the new stock shows up without
+    # waiting for the next 5-minute cycle
+    threading.Thread(target=do_refresh, daemon=True).start()
+
+    return jsonify({"tickers": [t.replace(".NS", "") for t in tickers]})
+
+
+@app.route("/api/watchlist/remove", methods=["POST"])
+def remove_from_watchlist():
+    body = request.get_json(force=True)
+    raw = (body.get("ticker") or "").strip().upper()
+    ticker = raw if raw.endswith(".NS") else raw + ".NS"
+
+    with watchlist_lock:
+        tickers = load_watchlist()
+        if ticker not in tickers:
+            return jsonify({"error": f"{raw} is not in the watchlist"}), 400
+        tickers.remove(ticker)
+        save_watchlist(tickers)
+
+    threading.Thread(target=do_refresh, daemon=True).start()
+
+    return jsonify({"tickers": [t.replace(".NS", "") for t in tickers]})
 
 
 @app.route("/api/funds", methods=["GET", "POST"])

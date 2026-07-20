@@ -31,22 +31,35 @@
     <span id="fundsStatus"></span>
   </div>
 
+  <div class="funds-bar">
+    <label for="newTicker">Add stock (NSE symbol):</label>
+    <input type="text" id="newTicker" placeholder="e.g. RELIANCE" style="text-transform:uppercase;">
+    <button onclick="addTicker()">Add</button>
+    <span id="watchlistStatus"></span>
+    <span id="watchlistCount" style="margin-left:auto; color:#888; font-size:12px;"></span>
+  </div>
+
   <table>
     <thead>
       <tr>
         <th>Ticker</th>
         <th>Price (₹)</th>
+        <th>Qty You Can Buy</th>
         <th>SMA9</th>
         <th>SMA21</th>
         <th>RSI</th>
         <th>Signal</th>
         <th>Reason</th>
+        <th></th>
       </tr>
     </thead>
     <tbody id="rows"></tbody>
   </table>
 
 <script>
+const MAX_WATCHLIST = 5;
+let availableFunds = 0;
+
 async function loadSignals() {
   try {
     const res = await fetch('/api/signals');
@@ -54,23 +67,33 @@ async function loadSignals() {
     document.getElementById('updated').textContent = 'Last updated: ' + (data.updated || '--');
     const rows = document.getElementById('rows');
     rows.innerHTML = '';
-    (data.stocks || []).forEach(s => {
+    const stocks = data.stocks || [];
+    // Split available funds evenly across the current watchlist
+    const fundsPerStock = stocks.length > 0 ? availableFunds / stocks.length : 0;
+
+    stocks.forEach(s => {
       const tr = document.createElement('tr');
       if (s.error) {
-        tr.innerHTML = `<td>${s.ticker}</td><td colspan="6" class="err">${s.error}</td>`;
+        tr.innerHTML = `<td>${s.ticker}</td><td colspan="7" class="err">${s.error}</td>
+          <td><button onclick="removeTicker('${s.ticker}')">✕</button></td>`;
       } else {
         const cls = s.signal === 'BUY' ? 'buy' : s.signal === 'SELL' ? 'sell' : 'hold';
+        const qty = s.price > 0 ? Math.floor(fundsPerStock / s.price) : 0;
         tr.innerHTML = `
           <td>${s.ticker}</td>
           <td>${s.price}</td>
+          <td>${qty}</td>
           <td>${s.sma_short ?? '-'}</td>
           <td>${s.sma_long ?? '-'}</td>
           <td>${s.rsi ?? '-'}</td>
           <td class="${cls}">${s.signal}</td>
-          <td class="reason">${s.reason}</td>`;
+          <td class="reason">${s.reason}</td>
+          <td><button onclick="removeTicker('${s.ticker}')">✕</button></td>`;
       }
       rows.appendChild(tr);
     });
+    document.getElementById('watchlistCount').textContent =
+      `${stocks.length}/${MAX_WATCHLIST} stocks`;
   } catch (e) {
     document.getElementById('updated').textContent = 'Error loading signals: ' + e;
   }
@@ -79,7 +102,8 @@ async function loadSignals() {
 async function loadFunds() {
   const res = await fetch('/api/funds');
   const data = await res.json();
-  document.getElementById('funds').value = data.available_funds || '';
+  availableFunds = data.available_funds || 0;
+  document.getElementById('funds').value = availableFunds || '';
 }
 
 async function saveFunds() {
@@ -89,12 +113,48 @@ async function saveFunds() {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ available_funds: val })
   });
+  availableFunds = val;
   document.getElementById('fundsStatus').textContent = 'Saved ✓';
   setTimeout(() => document.getElementById('fundsStatus').textContent = '', 2000);
+  loadSignals(); // recompute quantities with the new funds figure
 }
 
-loadSignals();
-loadFunds();
+async function addTicker() {
+  const input = document.getElementById('newTicker');
+  const ticker = input.value.trim().toUpperCase();
+  const statusEl = document.getElementById('watchlistStatus');
+  if (!ticker) return;
+
+  const res = await fetch('/api/watchlist/add', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ticker })
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    statusEl.textContent = data.error || 'Could not add';
+    statusEl.style.color = '#ef4444';
+  } else {
+    input.value = '';
+    statusEl.textContent = 'Added — refreshing…';
+    statusEl.style.color = '#22c55e';
+    setTimeout(loadSignals, 3000); // give the immediate background refresh a moment
+  }
+  setTimeout(() => statusEl.textContent = '', 3000);
+}
+
+async function removeTicker(ticker) {
+  const res = await fetch('/api/watchlist/remove', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ticker })
+  });
+  if (res.ok) {
+    loadSignals();
+  }
+}
+
+loadFunds().then(loadSignals);
 setInterval(loadSignals, 60000); // refresh every 60s
 </script>
 </body>
