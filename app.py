@@ -53,32 +53,64 @@ def compute_rsi(series, period=RSI_PERIOD):
     return rsi
 
 
-def analyze_ticker(ticker):
-    """Pull recent price history and compute signal for one ticker."""
-    try:
-        df = yf.download(ticker, period="5d", interval="5m", progress=False)
-        if df.empty or len(df) < LONG_WINDOW + 1:
-            return {"ticker": ticker, "error": "Not enough data"}
+def fetch_batch_with_retry(max_retries=3):
+    """
+    Fetch all watchlist tickers in a single yfinance call (much friendlier
+    to rate limits than one call per ticker), retrying with backoff on
+    rate-limit errors.
+    """
+    delay = 20  # seconds
+    for attempt in range(max_retries):
+        try:
+            data = yf.download(
+                WATCHLIST, period="5d", interval="5m",
+                progress=False, group_by="ticker", threads=False,
+            )
+            if data is not None and not data.empty:
+                return data
+        except Exception as e:
+            if "Rate limit" in str(e) or "Too Many Requests" in str(e):
+                time.sleep(delay)
+                delay *= 2
+                continue
+            raise
+        time.sleep(delay)
+        delay *= 2
+    return None
 
-        # yfinance sometimes returns multi-index columns; flatten if needed
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
+
+def analyze_ticker(ticker, batch_df):
+    """Compute signal for one ticker from an already-fetched batch DataFrame."""
+    try:
+        if batch_df is None:
+            return {"ticker": ticker.replace(".NS", ""), "error": "Rate limited, retrying next cycle"}
+
+        # With multiple tickers, yfinance returns a MultiIndex column DataFrame
+        if isinstance(batch_df.columns, pd.MultiIndex):
+            if ticker not in batch_df.columns.get_level_values(0):
+                return {"ticker": ticker.replace(".NS", ""), "error": "No data returned"}
+            df = batch_df[ticker].dropna(how="all")
+        else:
+            df = batch_df.dropna(how="all")
+
+        if df.empty or len(df) < LONG_WINDOW + 1:
+            return {"ticker": ticker.replace(".NS", ""), "error": "Not enough data"}
 
         close = df["Close"]
+        sma_short = close.rolling(window=SHORT_WINDOW).mean()
+        sma_long = close.rolling(window=LONG_WINDOW).mean()
+        rsi = compute_rsi(close)
 
-        df["SMA_short"] = close.rolling(window=SHORT_WINDOW).mean()
-        df["SMA_long"] = close.rolling(window=LONG_WINDOW).mean()
-        df["RSI"] = compute_rsi(close)
-
-        latest = df.iloc[-1]
-        prev = df.iloc[-2]
+        latest_close = float(close.iloc[-1])
+        latest_short, prev_short = float(sma_short.iloc[-1]), float(sma_short.iloc[-2])
+        latest_long, prev_long = float(sma_long.iloc[-1]), float(sma_long.iloc[-2])
+        rsi_val = float(rsi.iloc[-1]) if pd.notna(rsi.iloc[-1]) else None
 
         signal = "HOLD"
         reason = []
 
-        # SMA crossover logic
-        crossed_up = prev["SMA_short"] <= prev["SMA_long"] and latest["SMA_short"] > latest["SMA_long"]
-        crossed_down = prev["SMA_short"] >= prev["SMA_long"] and latest["SMA_short"] < latest["SMA_long"]
+        crossed_up = prev_short <= prev_long and latest_short > latest_long
+        crossed_down = prev_short >= prev_long and latest_short < latest_long
 
         if crossed_up:
             signal = "BUY"
@@ -87,8 +119,6 @@ def analyze_ticker(ticker):
             signal = "SELL"
             reason.append(f"SMA{SHORT_WINDOW} crossed below SMA{LONG_WINDOW}")
 
-        # RSI overlay
-        rsi_val = float(latest["RSI"]) if pd.notna(latest["RSI"]) else None
         if rsi_val is not None:
             if rsi_val < 30 and signal != "SELL":
                 signal = "BUY"
@@ -99,26 +129,26 @@ def analyze_ticker(ticker):
 
         return {
             "ticker": ticker.replace(".NS", ""),
-            "price": round(float(latest["Close"]), 2),
-            "sma_short": round(float(latest["SMA_short"]), 2) if pd.notna(latest["SMA_short"]) else None,
-            "sma_long": round(float(latest["SMA_long"]), 2) if pd.notna(latest["SMA_long"]) else None,
+            "price": round(latest_close, 2),
+            "sma_short": round(latest_short, 2) if pd.notna(latest_short) else None,
+            "sma_long": round(latest_long, 2) if pd.notna(latest_long) else None,
             "rsi": round(rsi_val, 2) if rsi_val is not None else None,
             "signal": signal,
             "reason": "; ".join(reason) if reason else "No crossover / neutral RSI",
-            "updated": pd.Timestamp.now().strftime("%H:%M:%S"),
         }
     except Exception as e:
         return {"ticker": ticker.replace(".NS", ""), "error": str(e)}
 
 
 def refresh_loop():
-    """Background thread: refresh all tickers every 60 seconds."""
+    """Background thread: refresh all tickers every 5 minutes (batched call)."""
     global latest_data
     while True:
-        results = [analyze_ticker(t) for t in WATCHLIST]
+        batch_df = fetch_batch_with_retry()
+        results = [analyze_ticker(t, batch_df) for t in WATCHLIST]
         with data_lock:
             latest_data = {"stocks": results, "updated": pd.Timestamp.now().strftime("%H:%M:%S")}
-        time.sleep(60)
+        time.sleep(300)  # 5 minutes between refreshes to stay well under rate limits
 
 
 @app.route("/api/signals")
@@ -142,10 +172,12 @@ def index():
     return app.send_static_file("index.html")
 
 
-# Do one synchronous fetch immediately so the dashboard isn't empty on load,
-# and start the background refresh thread. This runs whether the app is
+# Start the background refresh thread. This runs whether the app is
 # started directly (python3 app.py) or imported by gunicorn on Render.
-latest_data = {"stocks": [analyze_ticker(t) for t in WATCHLIST], "updated": pd.Timestamp.now().strftime("%H:%M:%S")}
+# It does its first fetch immediately, so the dashboard fills in shortly
+# after the page loads (poll /api/signals — it starts as {} for a few
+# seconds until the first batch completes).
+latest_data = {"stocks": [], "updated": None}
 _refresh_thread = threading.Thread(target=refresh_loop, daemon=True)
 _refresh_thread.start()
 
