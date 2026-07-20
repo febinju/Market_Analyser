@@ -12,6 +12,7 @@ import json
 import os
 import threading
 import time
+import traceback
 
 app = Flask(__name__)
 
@@ -102,13 +103,16 @@ def fetch_batch_with_retry(tickers, max_retries=3):
                 timeout=15,
             )
             data = resp.json()
+            print(f"[twelvedata] HTTP {resp.status_code} for symbols={symbols} -> {json.dumps(data)[:1000]}", flush=True)
+
             # Twelve Data returns {"code": 429, ...} when rate limited
-            if isinstance(data, dict) and data.get("code") in (429, 8, 429):
+            if isinstance(data, dict) and data.get("code") == 429:
                 time.sleep(delay)
                 delay *= 2
                 continue
             return data
         except Exception:
+            print(f"[twelvedata] Exception on attempt {attempt + 1}:\n{traceback.format_exc()}", flush=True)
             time.sleep(delay)
             delay *= 2
     return None
@@ -205,7 +209,10 @@ def refresh_loop():
     5 symbols x 30 refreshes/hour = 150 credits/hour, well under the
     Twelve Data free tier's 800/day limit."""
     while True:
-        do_refresh()
+        try:
+            do_refresh()
+        except Exception:
+            print(f"[refresh_loop] Unhandled exception:\n{traceback.format_exc()}", flush=True)
         time.sleep(120)
 
 
@@ -277,11 +284,32 @@ def index():
     return app.send_static_file("index.html")
 
 
-# Start the background refresh thread. This runs whether the app is
-# started directly (python3 app.py) or imported by gunicorn on Render.
+# Start the background refresh thread lazily, on the first incoming
+# request, rather than at import time. Some gunicorn configurations fork
+# worker processes after importing the app module, and threads started
+# during that import do not survive fork() — only the main thread does.
+# Starting on first request guarantees this runs inside the actual
+# serving process.
+_thread_started = False
+_thread_start_lock = threading.Lock()
+
+
+def ensure_refresh_thread():
+    global _thread_started
+    with _thread_start_lock:
+        if not _thread_started:
+            _thread_started = True
+            threading.Thread(target=refresh_loop, daemon=True).start()
+            print("[startup] background refresh thread started", flush=True)
+
+
+@app.before_request
+def _start_thread_once():
+    ensure_refresh_thread()
+
+
 latest_data = {"stocks": [], "updated": None}
-_refresh_thread = threading.Thread(target=refresh_loop, daemon=True)
-_refresh_thread.start()
 
 if __name__ == "__main__":
+    ensure_refresh_thread()
     app.run(debug=False, port=5000)
