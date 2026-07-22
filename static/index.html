@@ -19,6 +19,12 @@
   .reason { color: #999; font-size: 12px; }
   .err { color: #f59e0b; }
 </style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+  .chart-row td { padding: 16px; background: #161616; }
+  .chart-btn { background: #2a2a2a; border: 1px solid #444; color: #ccc; border-radius: 6px; padding: 4px 10px; cursor: pointer; font-size: 12px; }
+  .chart-btn:hover { background: #333; }
+</style>
 </head>
 <body>
   <h1>Watchlist Signals</h1>
@@ -51,6 +57,7 @@
         <th>Signal</th>
         <th>Reason</th>
         <th></th>
+        <th></th>
       </tr>
     </thead>
     <tbody id="rows"></tbody>
@@ -59,6 +66,9 @@
 <script>
 const MAX_WATCHLIST = 5;
 let availableFunds = 0;
+let latestStocks = {};      // ticker -> full stock object (incl. history)
+let openCharts = new Set(); // tickers whose chart row is currently expanded
+let chartInstances = {};    // ticker -> Chart.js instance
 
 async function loadSignals() {
   try {
@@ -68,17 +78,20 @@ async function loadSignals() {
     const rows = document.getElementById('rows');
     rows.innerHTML = '';
     const stocks = data.stocks || [];
+    latestStocks = {};
     // Split available funds evenly across the current watchlist
     const fundsPerStock = stocks.length > 0 ? availableFunds / stocks.length : 0;
 
     stocks.forEach(s => {
+      latestStocks[s.ticker] = s;
       const tr = document.createElement('tr');
       if (s.error) {
         tr.innerHTML = `<td>${s.ticker}</td><td colspan="7" class="err">${s.error}</td>
-          <td><button onclick="removeTicker('${s.ticker}')">✕</button></td>`;
+          <td><button onclick="removeTicker('${s.ticker}')">✕</button></td><td></td>`;
       } else {
         const cls = s.signal === 'BUY' ? 'buy' : s.signal === 'SELL' ? 'sell' : 'hold';
         const qty = s.price > 0 ? Math.floor(fundsPerStock / s.price) : 0;
+        const hasHistory = s.history && s.history.length > 1;
         tr.innerHTML = `
           <td>${s.ticker}</td>
           <td>${s.price}</td>
@@ -88,15 +101,112 @@ async function loadSignals() {
           <td>${s.rsi ?? '-'}</td>
           <td class="${cls}">${s.signal}</td>
           <td class="reason">${s.reason}</td>
-          <td><button onclick="removeTicker('${s.ticker}')">✕</button></td>`;
+          <td><button onclick="removeTicker('${s.ticker}')">✕</button></td>
+          <td>${hasHistory ? `<button class="chart-btn" onclick="toggleChart('${s.ticker}')">📈 Chart</button>` : ''}</td>`;
       }
       rows.appendChild(tr);
+
+      // Re-render an already-open chart row right after its ticker's row
+      if (openCharts.has(s.ticker) && s.history) {
+        rows.appendChild(buildChartRow(s.ticker, s.history));
+      }
     });
     document.getElementById('watchlistCount').textContent =
       `${stocks.length}/${MAX_WATCHLIST} stocks`;
+
+    // Redraw charts for any rows still open after the table rebuild
+    openCharts.forEach(ticker => {
+      const s = latestStocks[ticker];
+      if (s && s.history) renderChart(ticker, s.history);
+    });
   } catch (e) {
     document.getElementById('updated').textContent = 'Error loading signals: ' + e;
   }
+}
+
+function buildChartRow(ticker, history) {
+  const tr = document.createElement('tr');
+  tr.className = 'chart-row';
+  tr.id = `chart-row-${ticker}`;
+  tr.innerHTML = `<td colspan="10"><canvas id="chart-${ticker}" height="70"></canvas></td>`;
+  return tr;
+}
+
+function toggleChart(ticker) {
+  if (openCharts.has(ticker)) {
+    openCharts.delete(ticker);
+    if (chartInstances[ticker]) {
+      chartInstances[ticker].destroy();
+      delete chartInstances[ticker];
+    }
+    const row = document.getElementById(`chart-row-${ticker}`);
+    if (row) row.remove();
+  } else {
+    openCharts.add(ticker);
+    const s = latestStocks[ticker];
+    if (s && s.history) {
+      // Insert the chart row right after this ticker's table row
+      const rows = document.getElementById('rows');
+      const allRows = Array.from(rows.children);
+      const tickerRowIndex = allRows.findIndex(r => r.firstElementChild && r.firstElementChild.textContent === ticker);
+      const chartRow = buildChartRow(ticker, s.history);
+      if (tickerRowIndex >= 0 && allRows[tickerRowIndex].nextSibling) {
+        rows.insertBefore(chartRow, allRows[tickerRowIndex].nextSibling);
+      } else {
+        rows.appendChild(chartRow);
+      }
+      renderChart(ticker, s.history);
+    }
+  }
+}
+
+function renderChart(ticker, history) {
+  const canvas = document.getElementById(`chart-${ticker}`);
+  if (!canvas) return;
+  if (chartInstances[ticker]) chartInstances[ticker].destroy();
+
+  const labels = history.map(h => h.time);
+  const prices = history.map(h => h.price);
+  const pointColors = history.map(h => h.signal === 'BUY' ? '#22c55e' : h.signal === 'SELL' ? '#ef4444' : 'transparent');
+  const pointRadii = history.map(h => h.signal === 'HOLD' ? 0 : 6);
+  const pointStyles = history.map(h => h.signal === 'BUY' ? 'triangle' : h.signal === 'SELL' ? 'rectRot' : 'circle');
+
+  chartInstances[ticker] = new Chart(canvas.getContext('2d'), {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [{
+        label: `${ticker} price (₹)`,
+        data: prices,
+        borderColor: '#3b82f6',
+        backgroundColor: 'transparent',
+        borderWidth: 1.5,
+        pointBackgroundColor: pointColors,
+        pointBorderColor: pointColors,
+        pointRadius: pointRadii,
+        pointStyle: pointStyles,
+        tension: 0.15,
+      }]
+    },
+    options: {
+      responsive: true,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: {
+            label: (ctx) => {
+              const h = history[ctx.dataIndex];
+              return `₹${h.price}` + (h.signal !== 'HOLD' ? ` — ${h.signal}` : '');
+            }
+          }
+        }
+      },
+      scales: {
+        x: { ticks: { color: '#888', maxTicksLimit: 10 }, grid: { color: '#222' } },
+        y: { ticks: { color: '#888' }, grid: { color: '#222' } },
+      }
+    }
+  });
 }
 
 async function loadFunds() {
@@ -144,6 +254,11 @@ async function addTicker() {
 }
 
 async function removeTicker(ticker) {
+  openCharts.delete(ticker);
+  if (chartInstances[ticker]) {
+    chartInstances[ticker].destroy();
+    delete chartInstances[ticker];
+  }
   const res = await fetch('/api/watchlist/remove', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

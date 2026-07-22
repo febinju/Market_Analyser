@@ -1,13 +1,13 @@
 """
 Day Trading Signal App - Backend
-Fetches live price data for a watchlist of NSE stocks via the Twelve Data
-API, computes simple technical indicators (SMA crossover + RSI), and
-serves buy/sell signals as JSON to a browser dashboard.
+Fetches live price data for a watchlist of NSE stocks via yfinance,
+computes simple technical indicators (SMA crossover + RSI), and serves
+buy/sell signals as JSON to a browser dashboard.
 """
 
 from flask import Flask, jsonify, request
+import yfinance as yf
 import pandas as pd
-import requests
 import json
 import os
 import threading
@@ -17,6 +17,7 @@ import traceback
 app = Flask(__name__)
 
 # ---- Config ----
+# Stored without ".NS" suffix; added back only when calling yfinance
 DEFAULT_WATCHLIST = ["SUZLON", "IDEA", "IEX", "YESBANK", "TATAPOWER"]
 MAX_WATCHLIST_SIZE = 5
 
@@ -24,16 +25,11 @@ SHORT_WINDOW = 9    # short SMA period (in candles)
 LONG_WINDOW = 21     # long SMA period (in candles)
 RSI_PERIOD = 14
 
-# Set this as an environment variable named TWELVE_DATA_API_KEY
-# (on Render: Dashboard -> your service -> Environment -> Add Environment Variable)
-TWELVE_DATA_API_KEY = os.environ.get("TWELVE_DATA_API_KEY", "")
-TWELVE_DATA_URL = "https://api.twelvedata.com/time_series"
-
 FUNDS_FILE = os.path.join(os.path.dirname(__file__), "funds.json")
 WATCHLIST_FILE = os.path.join(os.path.dirname(__file__), "watchlist.json")
 
 # In-memory cache of the latest computed signals
-latest_data = {}
+latest_data = {"stocks": [], "updated": None}
 data_lock = threading.Lock()
 watchlist_lock = threading.Lock()
 
@@ -73,111 +69,105 @@ def compute_rsi(series, period=RSI_PERIOD):
     return rsi
 
 
-def to_td_symbol(ticker):
-    """Twelve Data expects NSE symbols as e.g. 'RELIANCE:NSE'."""
-    return f"{ticker}:NSE"
+def to_yf_symbol(ticker):
+    return f"{ticker}.NS"
 
 
-def fetch_batch_with_retry(tickers, max_retries=3):
+def fetch_batch_with_retry(tickers, max_retries=4):
     """
-    Fetch all watchlist tickers in a single Twelve Data time_series call
-    (comma-separated symbols), retrying with backoff if rate limited.
+    Fetch all watchlist tickers in a single yfinance call (much friendlier
+    to rate limits than one call per ticker), retrying with backoff on
+    rate-limit errors.
     """
     if not tickers:
         return None
-    if not TWELVE_DATA_API_KEY:
-        return "NO_API_KEY"
-
-    symbols = ",".join(to_td_symbol(t) for t in tickers)
-    delay = 15  # seconds
+    yf_symbols = [to_yf_symbol(t) for t in tickers]
+    delay = 20  # seconds
     for attempt in range(max_retries):
         try:
-            resp = requests.get(
-                TWELVE_DATA_URL,
-                params={
-                    "symbol": symbols,
-                    "interval": "5min",
-                    "outputsize": 50,
-                    "apikey": TWELVE_DATA_API_KEY,
-                },
-                timeout=15,
+            data = yf.download(
+                yf_symbols, period="5d", interval="5m",
+                progress=False, group_by="ticker", threads=False,
             )
-            data = resp.json()
-            print(f"[twelvedata] HTTP {resp.status_code} for symbols={symbols} -> {json.dumps(data)[:1000]}", flush=True)
-
-            # Twelve Data returns {"code": 429, ...} when rate limited
-            if isinstance(data, dict) and data.get("code") == 429:
+            print(f"[yfinance] attempt {attempt + 1}: got data, empty={data.empty if data is not None else 'N/A'}", flush=True)
+            if data is not None and not data.empty:
+                return data
+        except Exception as e:
+            print(f"[yfinance] Exception on attempt {attempt + 1}: {e}", flush=True)
+            if "Rate limit" in str(e) or "Too Many Requests" in str(e):
                 time.sleep(delay)
                 delay *= 2
                 continue
-            return data
-        except Exception:
-            print(f"[twelvedata] Exception on attempt {attempt + 1}:\n{traceback.format_exc()}", flush=True)
-            time.sleep(delay)
-            delay *= 2
+        time.sleep(delay)
+        delay *= 2
     return None
 
 
-def analyze_ticker(ticker, batch_data):
-    """Compute signal for one ticker from the already-fetched batch response."""
+def analyze_ticker(ticker, batch_df):
+    """Compute signal for one ticker from an already-fetched batch DataFrame."""
     try:
-        if batch_data == "NO_API_KEY":
-            return {"ticker": ticker, "error": "Missing TWELVE_DATA_API_KEY environment variable"}
-        if not batch_data:
-            return {"ticker": ticker, "error": "Rate limited or no response, retrying next cycle"}
+        if batch_df is None:
+            return {"ticker": ticker, "error": "Rate limited, retrying next cycle"}
 
-        symbol_key = to_td_symbol(ticker)
+        yf_symbol = to_yf_symbol(ticker)
 
-        # When multiple symbols are requested, Twelve Data nests each under
-        # its symbol key. When only one symbol is requested, the response is
-        # flat (meta/values/status at the top level).
-        if isinstance(batch_data, dict) and symbol_key in batch_data:
-            entry = batch_data[symbol_key]
-        elif isinstance(batch_data, dict) and "values" in batch_data:
-            entry = batch_data
+        if isinstance(batch_df.columns, pd.MultiIndex):
+            if yf_symbol not in batch_df.columns.get_level_values(0):
+                return {"ticker": ticker, "error": "No data returned"}
+            df = batch_df[yf_symbol].dropna(how="all")
         else:
-            entry = None
+            df = batch_df.dropna(how="all")
 
-        if entry is None or entry.get("status") == "error":
-            msg = entry.get("message") if entry else "No data returned"
-            return {"ticker": ticker, "error": msg}
-
-        values = entry.get("values", [])
-        if len(values) < LONG_WINDOW + 1:
+        if df.empty or len(df) < LONG_WINDOW + 1:
             return {"ticker": ticker, "error": "Not enough data"}
 
-        # Twelve Data returns most-recent-first; sort ascending for rolling calcs
-        values = sorted(values, key=lambda v: v["datetime"])
-        close = pd.Series([float(v["close"]) for v in values])
-
+        close = df["Close"]
         sma_short = close.rolling(window=SHORT_WINDOW).mean()
         sma_long = close.rolling(window=LONG_WINDOW).mean()
         rsi = compute_rsi(close)
 
+        # Compute a signal for every candle (vectorized), not just the latest,
+        # so we can chart the full intraday history of buy/sell points.
+        crossed_up_series = (sma_short.shift(1) <= sma_long.shift(1)) & (sma_short > sma_long)
+        crossed_down_series = (sma_short.shift(1) >= sma_long.shift(1)) & (sma_short < sma_long)
+        rsi_oversold = rsi < 30
+        rsi_overbought = rsi > 70
+
+        signals = pd.Series("HOLD", index=df.index)
+        signals[crossed_up_series] = "BUY"
+        signals[crossed_down_series] = "SELL"
+        signals[rsi_oversold & (signals != "SELL")] = "BUY"
+        signals[rsi_overbought & (signals != "BUY")] = "SELL"
+
+        # Restrict intraday history to today's session only (same calendar
+        # date as the most recent candle, robust to timezone quirks)
+        last_date = df.index[-1].date()
+        today_mask = df.index.date == last_date
+        history = [
+            {
+                "time": ts.strftime("%H:%M"),
+                "price": round(float(price), 2),
+                "signal": sig,
+            }
+            for ts, price, sig in zip(df.index[today_mask], close[today_mask], signals[today_mask])
+        ]
+
         latest_close = float(close.iloc[-1])
-        latest_short, prev_short = float(sma_short.iloc[-1]), float(sma_short.iloc[-2])
-        latest_long, prev_long = float(sma_long.iloc[-1]), float(sma_long.iloc[-2])
+        latest_short = float(sma_short.iloc[-1])
+        latest_long = float(sma_long.iloc[-1])
         rsi_val = float(rsi.iloc[-1]) if pd.notna(rsi.iloc[-1]) else None
+        signal = signals.iloc[-1]
 
-        signal = "HOLD"
         reason = []
-
-        crossed_up = prev_short <= prev_long and latest_short > latest_long
-        crossed_down = prev_short >= prev_long and latest_short < latest_long
-
-        if crossed_up:
-            signal = "BUY"
-            reason.append(f"SMA{SHORT_WINDOW} crossed above SMA{LONG_WINDOW}")
-        elif crossed_down:
-            signal = "SELL"
-            reason.append(f"SMA{SHORT_WINDOW} crossed below SMA{LONG_WINDOW}")
-
-        if rsi_val is not None:
-            if rsi_val < 30 and signal != "SELL":
-                signal = "BUY"
+        if signal == "BUY":
+            if crossed_up_series.iloc[-1]:
+                reason.append(f"SMA{SHORT_WINDOW} crossed above SMA{LONG_WINDOW}")
+            if rsi_val is not None and rsi_val < 30:
                 reason.append(f"RSI oversold ({rsi_val:.1f})")
-            elif rsi_val > 70 and signal != "BUY":
-                signal = "SELL"
+        elif signal == "SELL":
+            if crossed_down_series.iloc[-1]:
+                reason.append(f"SMA{SHORT_WINDOW} crossed below SMA{LONG_WINDOW}")
+            if rsi_val is not None and rsi_val > 70:
                 reason.append(f"RSI overbought ({rsi_val:.1f})")
 
         return {
@@ -188,6 +178,7 @@ def analyze_ticker(ticker, batch_data):
             "rsi": round(rsi_val, 2) if rsi_val is not None else None,
             "signal": signal,
             "reason": "; ".join(reason) if reason else "No crossover / neutral RSI",
+            "history": history,
         }
     except Exception as e:
         return {"ticker": ticker, "error": str(e)}
@@ -198,22 +189,20 @@ def do_refresh():
     global latest_data
     with watchlist_lock:
         tickers = load_watchlist()
-    batch_data = fetch_batch_with_retry(tickers)
-    results = [analyze_ticker(t, batch_data) for t in tickers]
+    batch_df = fetch_batch_with_retry(tickers)
+    results = [analyze_ticker(t, batch_df) for t in tickers]
     with data_lock:
         latest_data = {"stocks": results, "updated": pd.Timestamp.now().strftime("%H:%M:%S")}
 
 
 def refresh_loop():
-    """Background thread: refresh the watchlist every 2 minutes.
-    5 symbols x 30 refreshes/hour = 150 credits/hour, well under the
-    Twelve Data free tier's 800/day limit."""
+    """Background thread: refresh the watchlist every 5 minutes (batched call)."""
     while True:
         try:
             do_refresh()
         except Exception:
             print(f"[refresh_loop] Unhandled exception:\n{traceback.format_exc()}", flush=True)
-        time.sleep(120)
+        time.sleep(300)
 
 
 @app.route("/api/signals")
@@ -245,8 +234,6 @@ def add_to_watchlist():
         tickers.append(ticker)
         save_watchlist(tickers)
 
-    # Refresh immediately in the background so the new stock shows up without
-    # waiting for the next scheduled cycle
     threading.Thread(target=do_refresh, daemon=True).start()
 
     return jsonify({"tickers": tickers})
@@ -307,8 +294,6 @@ def ensure_refresh_thread():
 def _start_thread_once():
     ensure_refresh_thread()
 
-
-latest_data = {"stocks": [], "updated": None}
 
 if __name__ == "__main__":
     ensure_refresh_thread()
